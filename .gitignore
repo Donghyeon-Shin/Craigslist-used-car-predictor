@@ -4,3 +4,12 @@
 
 # dataset
 /Data
+
+# Original dataset
+vehicles.csv
+
+# VIN dataset
+vehicles_msrp.csv
+
+#Created dataset
+preprocessed_used_cars_sample_10000.csv
