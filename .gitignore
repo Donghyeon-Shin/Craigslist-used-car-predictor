@@ -11,5 +11,8 @@ vehicles.csv
 # VIN dataset
 vehicles_msrp.csv
 
-#Created dataset
+# Created dataset
 preprocessed_used_cars_sample_10000.csv
+
+# Generated classification dataset
+vehicles_with_price_class.csv
