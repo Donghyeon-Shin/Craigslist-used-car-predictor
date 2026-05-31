@@ -60,46 +60,54 @@ print('Test data shape:', df_test.shape)
 # CarGurus IMV boundaries: < -10% → Underpriced | > +5% → Overpriced
 # -----------------------------------------------------------------------------
 target_col  = 'price'
-exclude_reg = ['price']          
+exclude_reg = ['price']   # estimate_msrp: 6만개 test에 없으므로 제외
 reg_feature_cols = [c for c in df_train.columns if c not in exclude_reg]
 
 X_reg = df_train[reg_feature_cols].copy()
 y_reg = df_train[target_col].copy()
 
+# price는 원본값(달러) — regression과 동일하게 log1p 변환 후 학습
+# 예측값은 expm1으로 달러 단위 복원 후 gap_ratio 계산
+y_reg_log = np.log1p(y_reg)
+
 # OOF(Out-Of-Fold) Prediction — Use instead of a simple 8:2 split
-# Reason: Only 20% (~1,440 labels) will be used for learning in 8:2 segmentation, resulting in a lack of classification learning data
+# Reason: Only 20% (~1,440 labels) will be used for learning in 8:2 segmentation,
+#         resulting in a lack of classification learning data
 #
 # Fold 1: Train=2~5, Test=1 → Fold 1 predict
 # Fold 2: Train=1/3~5, Test=2 → Fold 2 predict
 # After 5 repetitions, 7,192 predictions are completed
-numeric_cols = ['condition', 'odometer', 'vehicle_age', 'estimate_msrp']
+numeric_cols = ['condition', 'odometer', 'vehicle_age']
 kf           = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 lr_model     = LinearRegression()
 
-y_pred_oof = np.zeros(len(y_reg))   # Save final OOF predictions
+y_pred_oof_log = np.zeros(len(y_reg))   # log scale OOF 예측값 저장
 
 for fold, (tr_idx, val_idx) in enumerate(kf.split(X_reg), 1):
     X_fold_tr, X_fold_val = X_reg.iloc[tr_idx].copy(), X_reg.iloc[val_idx].copy()
-    y_fold_tr             = y_reg.iloc[tr_idx]
+    y_fold_tr_log         = y_reg_log.iloc[tr_idx]   # log1p 적용된 y로 학습
 
-    # TargetEncoder 
+    # TargetEncoder — log1p(y) 기준으로 fit (regression과 동일)
     te_fold = ce.TargetEncoder(cols=['model'], smoothing=10)
-    X_fold_tr['model']  = te_fold.fit_transform(X_fold_tr[['model']], y_fold_tr)['model'].values
+    X_fold_tr['model']  = te_fold.fit_transform(X_fold_tr[['model']], y_fold_tr_log)['model'].values
     X_fold_val['model'] = te_fold.transform(X_fold_val[['model']])['model'].values
     X_fold_tr.rename(columns={'model': 'model_encoded'},  inplace=True)
     X_fold_val.rename(columns={'model': 'model_encoded'}, inplace=True)
 
-    # StandardScaler 
+    # StandardScaler
     scaler_fold = StandardScaler()
     X_fold_tr[numeric_cols]  = scaler_fold.fit_transform(X_fold_tr[numeric_cols])
     X_fold_val[numeric_cols] = scaler_fold.transform(X_fold_val[numeric_cols])
 
-    lr_model.fit(X_fold_tr, y_fold_tr)
-    y_pred_oof[val_idx] = lr_model.predict(X_fold_val)
-    print(f'  Fold {fold} | val R² = {r2_score(y_reg.iloc[val_idx], y_pred_oof[val_idx]):.4f}')
+    lr_model.fit(X_fold_tr, y_fold_tr_log)
+    y_pred_oof_log[val_idx] = lr_model.predict(X_fold_val)
+    # R² 계산은 expm1 복원 후 원본 달러 단위 기준
+    y_val_pred_dollar = np.clip(np.expm1(y_pred_oof_log[val_idx]), 0, None)
+    print(f'  Fold {fold} | val R² = {r2_score(y_reg.iloc[val_idx], y_val_pred_dollar):.4f}')
 
-y_pred_reg = y_pred_oof
-print(f'\nOOF R² = {r2_score(y_reg, y_pred_reg):.4f}')
+# expm1으로 달러 단위 복원
+y_pred_reg = np.clip(np.expm1(y_pred_oof_log), 0, None)
+print(f'\nOOF R² (달러 단위) = {r2_score(y_reg, y_pred_reg):.4f}')
 
 # gap_ratio = (actual - predicted) / predicted × 100 (%)
 # Underpriced  : gap_ratio < -10%
@@ -185,10 +193,12 @@ print('Class distribution is balanced — no SMOTE needed.')
 # -----------------------------------------------------------------------------
 exclude_clf = ['price', 'model', 'estimate_msrp', 'gap_ratio', 'price_class',
                'manufacturer_chrysler']
-train_feature_cols = [c for c in df_train.columns if c not in exclude_clf]
+# model은 TargetEncoder로 Step 5에서 처리 — 여기서는 문자열 상태로 피처에 포함
+train_feature_cols = [c for c in df_train.columns if c not in exclude_clf] + ['model']
 
-exclude_test = ['price', 'model', 'estimate_msrp']
-test_feature_cols = [c for c in df_test.columns if c not in exclude_test]
+# price_log: 학습 피처 불필요 (Step 13 분석용으로만 df_test에 보존)
+exclude_test = ['price_log', 'model', 'estimate_msrp']
+test_feature_cols = [c for c in df_test.columns if c not in exclude_test] + ['model']
 
 for col in test_feature_cols:
     if col not in train_feature_cols:
@@ -205,6 +215,7 @@ X_clf      = df_train[train_feature_cols].copy()
 y_clf      = df_train['price_class'].copy()
 X_test_clf = df_test[test_feature_cols_sorted].copy()
 
+# 스케일러는 Step 5에서 train split 후에 fit — 여기서는 정의만
 clf_numeric_cols = ['condition', 'odometer', 'vehicle_age']
 scaler_clf = StandardScaler()
 
@@ -219,6 +230,14 @@ print(f'X_test_clf shape: {X_test_clf.shape}')
 X_train, X_val, y_train, y_val = train_test_split(
     X_clf, y_clf, test_size=0.2, random_state=RANDOM_STATE, stratify=y_clf
 )
+
+te_clf = ce.TargetEncoder(cols=['model'], smoothing=10)
+X_train['model'] = te_clf.fit_transform(X_train[['model']], y_train)['model'].values
+X_val['model']   = te_clf.transform(X_val[['model']])['model'].values
+X_test_clf['model'] = te_clf.transform(X_test_clf[['model']])['model'].values
+X_train.rename(columns={'model': 'model_encoded'}, inplace=True)
+X_val.rename(columns={'model': 'model_encoded'},   inplace=True)
+X_test_clf.rename(columns={'model': 'model_encoded'}, inplace=True)
 
 X_train[clf_numeric_cols] = scaler_clf.fit_transform(X_train[clf_numeric_cols])
 X_val[clf_numeric_cols]   = scaler_clf.transform(X_val[clf_numeric_cols])
@@ -236,6 +255,7 @@ models = {
     'Decision Tree'      : DecisionTreeClassifier(max_depth=10, random_state=RANDOM_STATE),
     'KNN'                : KNeighborsClassifier(n_neighbors=7),
     'Random Forest'      : RandomForestClassifier(n_estimators=100, max_depth=15,
+                                                  class_weight='balanced',
                                                    random_state=RANDOM_STATE, n_jobs=-1),
 }
 print('Models:', list(models.keys()))
