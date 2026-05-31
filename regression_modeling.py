@@ -170,6 +170,13 @@ for grp, feats in OHE_GROUPS.items():
 # At each step: compute VIF → train & record metrics → drop highest-VIF feature
 # (or its full OHE group) → repeat until all VIFs < 10.
 # -----------------------------------------------------------------------------
+
+# --- Inner split: Train → inner Train(64%) + Validation(16%) ---
+X_tr_inner, X_val_inner, y_tr_inner_log, y_val_inner_log = train_test_split(
+    X_train, y_train_log, test_size=0.2, random_state=42
+)
+print(f'Inner Train: {X_tr_inner.shape}  Validation: {X_val_inner.shape}')
+
 current_numeric = numeric_feats.copy()
 history = []
 
@@ -179,8 +186,8 @@ print('=' * 85)
 step = 0
 while len(current_numeric) > 1:
 
-    # --- VIF calculation ---
-    vif_data  = X_train[current_numeric].copy()
+    # --- VIF calculation (inner train 기준) ---
+    vif_data  = X_tr_inner[current_numeric].copy()
     vif_const = add_constant(vif_data)
     vif_vals  = [
         variance_inflation_factor(vif_const.values, i + 1)
@@ -189,23 +196,23 @@ while len(current_numeric) > 1:
     max_vif      = max(vif_vals)
     max_vif_feat = current_numeric[int(np.argmax(vif_vals))]
 
-    # --- Train Baseline (no estimate_msrp) and record metrics ---
+    # --- Train Baseline (no estimate_msrp), evaluate on Validation ---
     feats     = current_numeric + ['model']
-    X_tr_iter = X_train[feats].drop(columns=['estimate_msrp'], errors='ignore')
-    X_te_iter = X_test[feats].drop(columns=['estimate_msrp'],  errors='ignore')
+    X_tr_iter = X_tr_inner[feats].drop(columns=['estimate_msrp'], errors='ignore')
+    X_va_iter = X_val_inner[feats].drop(columns=['estimate_msrp'], errors='ignore')
 
     sc = [c for c in ['odometer', 'vehicle_age'] if c in X_tr_iter.columns]
-    X_tr_enc, X_te_enc, _, _ = encode_and_scale(X_tr_iter, X_te_iter, y_train_log, scale_cols=sc)
+    X_tr_enc, X_va_enc, _, _ = encode_and_scale(X_tr_iter, X_va_iter, y_tr_inner_log, scale_cols=sc)
 
     lr = LinearRegression()
-    lr.fit(X_tr_enc, y_train_log)
-    y_pred = np.clip(np.expm1(lr.predict(X_te_enc)), 0, None)
-    y_true = np.expm1(y_test_log)
+    lr.fit(X_tr_enc, y_tr_inner_log)
+    y_pred = np.clip(np.expm1(lr.predict(X_va_enc)), 0, None)
+    y_true = np.expm1(y_val_inner_log)
 
-    n_te   = len(y_true)
-    p_te   = X_te_enc.shape[1]
+    n_val  = len(y_true)
+    p_val  = X_va_enc.shape[1]
     r2     = r2_score(y_true, y_pred)
-    adj_r2 = adjusted_r2(r2, n_te, p_te)
+    adj_r2 = adjusted_r2(r2, n_val, p_val)
     rmse   = np.sqrt(mean_squared_error(y_true, y_pred))
 
     # --- Determine which features to remove ---
@@ -321,12 +328,11 @@ plt.show()
 # Adjusted R² is the key comparison metric because the two models differ
 # by exactly one feature; a plain R² comparison would always favour Enhanced.
 # -----------------------------------------------------------------------------
-X_final = df[SELECTED_FEATURES].copy()
-y_final = df['price'].copy()
+X_tr_final = X_train[SELECTED_FEATURES].copy()
+X_te_final = X_test[SELECTED_FEATURES].copy()
+y_tr_final = y_train.copy()
+y_te_final = y_test.copy()
 
-X_tr_final, X_te_final, y_tr_final, y_te_final = train_test_split(
-    X_final, y_final, test_size=0.2, random_state=42
-)
 y_tr_log = np.log1p(y_tr_final)
 y_te_log = np.log1p(y_te_final)
 

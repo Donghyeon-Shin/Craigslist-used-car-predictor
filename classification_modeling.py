@@ -9,6 +9,7 @@
 import platform
 import warnings
 
+import category_encoders as ce
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,8 +20,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import (accuracy_score, classification_report,
                              confusion_matrix, f1_score)
-from sklearn.model_selection import (StratifiedKFold, cross_val_score,
+from sklearn.model_selection import (KFold, StratifiedKFold, cross_val_score,
                                      train_test_split)
+from sklearn.metrics import r2_score as r2_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
@@ -40,51 +42,98 @@ N_FOLDS      = 5
 # -----------------------------------------------------------------------------
 # Step 1. Load Data
 # df_train  : 7,192 rows — residual calculation + classification training
-# df_test   : 54,805 rows (already scaled) — final classification target
+# df_test   : 54,805 rows (unscaled raw) — scaling applied later using
+#             the scaler fitted on df_train to ensure consistent units
 # -----------------------------------------------------------------------------
 df_train = pd.read_csv('preprocessed_vehicles.csv')
 print('Training data shape:', df_train.shape)
 
-df_test = pd.read_csv('preprocessed_vehicle_classification_scaled.csv')
+df_test = pd.read_csv('preprocessed_vehicle_classification_encoded.csv') 
 print('Test data shape:', df_test.shape)
 
 
 # -----------------------------------------------------------------------------
-# Step 2. Residual Calculation and Label Generation (Enhanced Regression)
-# Enhanced model (with estimate_msrp) gives the most accurate predictions,
-# so its residuals serve as the basis for price adequacy labels.
-# Label boundaries use the 33rd/67th percentiles of residuals so that
-# each class gets ~33% of samples, avoiding class imbalance from the start.
+# Step 2. OOF Gap-Ratio Label Generation (Enhanced Regression)
+# Out-Of-Fold prediction ensures all 7,192 samples get an unseen prediction,
+# avoiding the data shortage that a simple 8:2 split would cause (~1,440 labels).
+# gap_ratio = (actual - predicted) / predicted × 100 (%)
+# CarGurus IMV boundaries: < -10% → Underpriced | > +5% → Overpriced
 # -----------------------------------------------------------------------------
 target_col  = 'price'
-exclude_reg = ['price', 'model']
+exclude_reg = ['price']          
 reg_feature_cols = [c for c in df_train.columns if c not in exclude_reg]
 
 X_reg = df_train[reg_feature_cols].copy()
 y_reg = df_train[target_col].copy()
 
+# OOF(Out-Of-Fold) Prediction — Use instead of a simple 8:2 split
+# Reason: Only 20% (~1,440 labels) will be used for learning in 8:2 segmentation, resulting in a lack of classification learning data
+#
+# Fold 1: Train=2~5, Test=1 → Fold 1 predict
+# Fold 2: Train=1/3~5, Test=2 → Fold 2 predict
+# After 5 repetitions, 7,192 predictions are completed
 numeric_cols = ['condition', 'odometer', 'vehicle_age', 'estimate_msrp']
-scaler_reg   = StandardScaler()
-X_reg[numeric_cols] = scaler_reg.fit_transform(X_reg[numeric_cols])
+kf           = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+lr_model     = LinearRegression()
 
-lr_model = LinearRegression()
-lr_model.fit(X_reg, y_reg)
-y_pred_reg = lr_model.predict(X_reg)
+y_pred_oof = np.zeros(len(y_reg))   # Save final OOF predictions
 
-residuals = y_reg - y_pred_reg
-print(f'Residual Std Dev = {residuals.std():,.0f}')
-print(f'R² = {lr_model.score(X_reg, y_reg):.4f}')
+for fold, (tr_idx, val_idx) in enumerate(kf.split(X_reg), 1):
+    X_fold_tr, X_fold_val = X_reg.iloc[tr_idx].copy(), X_reg.iloc[val_idx].copy()
+    y_fold_tr             = y_reg.iloc[tr_idx]
 
-p33 = np.percentile(residuals, 33)
-p67 = np.percentile(residuals, 67)
-print(f'\nBoundaries:  33rd pct = ${p33:,.0f}  |  67th pct = ${p67:,.0f}')
+    # TargetEncoder 
+    te_fold = ce.TargetEncoder(cols=['model'], smoothing=10)
+    X_fold_tr['model']  = te_fold.fit_transform(X_fold_tr[['model']], y_fold_tr)['model'].values
+    X_fold_val['model'] = te_fold.transform(X_fold_val[['model']])['model'].values
+    X_fold_tr.rename(columns={'model': 'model_encoded'},  inplace=True)
+    X_fold_val.rename(columns={'model': 'model_encoded'}, inplace=True)
+
+    # StandardScaler 
+    scaler_fold = StandardScaler()
+    X_fold_tr[numeric_cols]  = scaler_fold.fit_transform(X_fold_tr[numeric_cols])
+    X_fold_val[numeric_cols] = scaler_fold.transform(X_fold_val[numeric_cols])
+
+    lr_model.fit(X_fold_tr, y_fold_tr)
+    y_pred_oof[val_idx] = lr_model.predict(X_fold_val)
+    print(f'  Fold {fold} | val R² = {r2_score(y_reg.iloc[val_idx], y_pred_oof[val_idx]):.4f}')
+
+y_pred_reg = y_pred_oof
+print(f'\nOOF R² = {r2_score(y_reg, y_pred_reg):.4f}')
+
+# gap_ratio = (actual - predicted) / predicted × 100 (%)
+# Underpriced  : gap_ratio < -10%
+# Fairly Priced: -10% ≤ gap_ratio ≤ +5%
+# Overpriced   : gap_ratio >  +5%
+LOWER_BOUND = -10.0   # %
+UPPER_BOUND =   5.0   # %
+
+valid_mask   = y_pred_reg > 0
+n_invalid    = (~valid_mask).sum()
+print(f'Samples excluded (pred≤0) = {n_invalid}')
+
+y_reg_series    = pd.Series(y_reg.values, index=df_train.index)
+y_pred_series   = pd.Series(y_pred_reg,   index=df_train.index)
+y_reg_valid     = y_reg_series[valid_mask]
+y_pred_valid    = y_pred_series[valid_mask]
+
+gap_ratio_valid = (y_reg_valid - y_pred_valid) / y_pred_valid * 100
+
+print(f'\ngap_ratio stats (valid {len(gap_ratio_valid):,} samples):')
+print(f'  Mean   = {gap_ratio_valid.mean():.2f}%')
+print(f'  Std    = {gap_ratio_valid.std():.2f}%')
+print(f'  Median = {gap_ratio_valid.median():.2f}%')
+print(f'\nBoundaries: LOWER = {LOWER_BOUND}%  |  UPPER = {UPPER_BOUND}%')
 
 # 0 = Underpriced, 1 = Fairly Priced, 2 = Overpriced
 price_class = pd.Series(1, index=df_train.index, name='price_class')
-price_class[residuals < p33] = 0
-price_class[residuals > p67] = 2
+price_class[gap_ratio_valid[gap_ratio_valid < LOWER_BOUND].index] = 0
+price_class[gap_ratio_valid[gap_ratio_valid > UPPER_BOUND].index] = 2
 
-df_train['residual']    = residuals.values
+gap_ratio_full = pd.Series(np.nan, index=df_train.index)
+gap_ratio_full[gap_ratio_valid.index] = gap_ratio_valid.values
+
+df_train['gap_ratio']   = gap_ratio_full.values
 df_train['price_class'] = price_class.values
 
 print('\nLabel distribution:')
@@ -122,7 +171,7 @@ axes[1].pie(
 )
 axes[1].set_title('Class Distribution (Pie Chart)', fontsize=13, fontweight='bold')
 
-plt.suptitle('Price Adequacy Class Distribution (N=7,192)', fontsize=14, fontweight='bold', y=1.02)
+plt.suptitle('Price Adequacy Class Distribution (N=7,192, gap_ratio threshold)', fontsize=14, fontweight='bold', y=1.02)
 plt.tight_layout()
 plt.show()
 print('Class distribution is balanced — no SMOTE needed.')
@@ -134,13 +183,13 @@ print('Class distribution is balanced — no SMOTE needed.')
 # on the 54,805-row test set which has no MSRP estimates.
 # Columns present in one dataset but not the other are reconciled here.
 # -----------------------------------------------------------------------------
-test_feature_cols = [c for c in df_test.columns if c not in ['model_encoded', 'price_log']]
-
-exclude_clf = ['price', 'model', 'estimate_msrp', 'residual', 'price_class',
+exclude_clf = ['price', 'model', 'estimate_msrp', 'gap_ratio', 'price_class',
                'manufacturer_chrysler']
 train_feature_cols = [c for c in df_train.columns if c not in exclude_clf]
 
-# Add any test-only columns to training data (filled with 0)
+exclude_test = ['price', 'model', 'estimate_msrp']
+test_feature_cols = [c for c in df_test.columns if c not in exclude_test]
+
 for col in test_feature_cols:
     if col not in train_feature_cols:
         df_train[col] = 0
@@ -156,10 +205,8 @@ X_clf      = df_train[train_feature_cols].copy()
 y_clf      = df_train['price_class'].copy()
 X_test_clf = df_test[test_feature_cols_sorted].copy()
 
-# Scale numeric columns — fit on training data only
 clf_numeric_cols = ['condition', 'odometer', 'vehicle_age']
 scaler_clf = StandardScaler()
-X_clf[clf_numeric_cols] = scaler_clf.fit_transform(X_clf[clf_numeric_cols])
 
 print(f'X_clf shape     : {X_clf.shape}')
 print(f'X_test_clf shape: {X_test_clf.shape}')
@@ -172,6 +219,11 @@ print(f'X_test_clf shape: {X_test_clf.shape}')
 X_train, X_val, y_train, y_val = train_test_split(
     X_clf, y_clf, test_size=0.2, random_state=RANDOM_STATE, stratify=y_clf
 )
+
+X_train[clf_numeric_cols] = scaler_clf.fit_transform(X_train[clf_numeric_cols])
+X_val[clf_numeric_cols]   = scaler_clf.transform(X_val[clf_numeric_cols])
+X_test_clf[clf_numeric_cols] = scaler_clf.transform(X_test_clf[clf_numeric_cols])
+
 print(f'Train: {X_train.shape[0]}  |  Validation: {X_val.shape[0]}')
 
 
@@ -199,8 +251,8 @@ skf        = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM
 cv_results = []
 
 for name, model in models.items():
-    acc_scores = cross_val_score(model, X_clf, y_clf, cv=skf, scoring='accuracy', n_jobs=-1)
-    f1_scores  = cross_val_score(model, X_clf, y_clf, cv=skf, scoring='f1_macro',  n_jobs=-1)
+    acc_scores = cross_val_score(model, X_train, y_train, cv=skf, scoring='accuracy', n_jobs=-1)
+    f1_scores  = cross_val_score(model, X_train, y_train, cv=skf, scoring='f1_macro',  n_jobs=-1)
     cv_results.append({
         'Model'   : name,
         'Acc Mean': acc_scores.mean(),
@@ -307,7 +359,9 @@ plt.show()
 # Step 11. Apply Classification to 54,805-Row Test Data
 # Retrain on all 7,192 rows first to maximise information before inference.
 # -----------------------------------------------------------------------------
-best_model.fit(X_clf, y_clf)
+X_all_clf = pd.concat([X_train, X_val])
+y_all_clf = pd.concat([y_train, y_val])
+best_model.fit(X_all_clf, y_all_clf)
 y_test_pred = best_model.predict(X_test_clf)
 
 df_test['price_class'] = y_test_pred
