@@ -45,10 +45,10 @@ N_FOLDS      = 5
 # df_test   : 54,805 rows (unscaled raw) — scaling applied later using
 #             the scaler fitted on df_train to ensure consistent units
 # -----------------------------------------------------------------------------
-df_train = pd.read_csv('preprocessed_vehicles.csv')
+df_train = pd.read_csv('./Data/preprocessed_vehicles.csv')
 print('Training data shape:', df_train.shape)
 
-df_test = pd.read_csv('preprocessed_vehicle_classification_encoded.csv') 
+df_test = pd.read_csv('./Data/preprocessed_vehicle_classification_encoded.csv') 
 print('Test data shape:', df_test.shape)
 
 
