@@ -1,608 +1,478 @@
-# %% [markdown]
-# # Vehicle Price Adequacy Classification Model Analysis
-# 
-# This notebook builds a model that classifies vehicle price adequacy into 3 classes based on residuals from a regression model (Enhanced Linear Regression).
-# 
-# ## Analysis Goals
-# 
-# - Generate price adequacy labels for each vehicle based on regression model residuals
-# - Compare multiple classification algorithms using K-Fold Cross Validation to select the optimal model
-# - Apply the selected model to a large dataset of approximately 54,805 vehicles to classify price adequacy
-# - Derive the overall pricing tendency of the dataset from the classification results
-# 
-# ## Classification Criteria
-# 
-# | Class | Label | Description |
-# |--------|------|------|
-# | 0 | Underpriced | Actual price < Predicted price (selling below market value) |
-# | 1 | Fairly Priced | Actual price ≈ Predicted price (appropriately priced) |
-# | 2 | Overpriced | Actual price > Predicted price (selling above market value) |
+# =============================================================================
+# Used Car Price Prediction — Regression Model Analysis
+# Data   : preprocessed_vehicles.csv
+# Model  : Linear Regression (Baseline vs Enhanced with estimate_msrp)
+# Flow   : Load → Split → log1p → VIF removal → Optimal step → Eval → Plot
+# =============================================================================
 
-# %%
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib
-import seaborn as sns
+import os
 import warnings
 
-from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score,
-    confusion_matrix, classification_report
-)
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, TargetEncoder
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools.tools import add_constant
 
 warnings.filterwarnings('ignore')
-
-import platform
-if platform.system() == 'Darwin':
-    matplotlib.rc('font', family='AppleGothic')
-else:
-    matplotlib.rc('font', family='Malgun Gothic')
 matplotlib.rcParams['axes.unicode_minus'] = False
+try:
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+except Exception:
+    plt.rcParams['font.family'] = 'DejaVu Sans'
 
-RANDOM_STATE = 42
-N_FOLDS     = 5
-print('Libraries loaded successfully')
 
-# %% [markdown]
-# ## Step 1. Load Data
-# 
-# Load the two datasets used in this analysis.
-# 
-# | File | Description | Role |
-# |------|------|------|
-# | `preprocessed_vehicles.csv` | 7,192 rows × 52 columns (preprocessed original data) | Regression residual calculation + classification model training |
-# | `preprocessed_vehicle_classification_scaled.csv` | 54,805 rows × 52 columns (scaled) | Target dataset for classification model application |
+# -----------------------------------------------------------------------------
+# Step 1. Load Data
+# -----------------------------------------------------------------------------
+csv_name = 'preprocessed_vehicles.csv'
+search_paths = [csv_name, os.path.join('Data', csv_name), os.path.join('..', csv_name)]
 
-# %%
-df_train = pd.read_csv('preprocessed_vehicles.csv')
-print('Training data shape:', df_train.shape)
+df = None
+for path in search_paths:
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        print(f'File loaded: {path}')
+        break
 
-df_test = pd.read_csv('preprocessed_vehicle_classification_scaled.csv')
-print('Test data shape:', df_test.shape)
-
-# %% [markdown]
-# ## Step 2. Residual Calculation and Label Generation via Enhanced Regression Model
-# 
-# Using the **Enhanced Linear Regression model** (including estimate_msrp) built in the regression analysis step,
-# calculate predicted prices for 7,192 vehicles and generate price adequacy labels based on residuals.
-# 
-# > **Why use the Enhanced model?**
-# > - The 7,192 training samples have `estimate_msrp`, so the Enhanced model can be used
-# > - The Enhanced model outperforms Baseline in all metrics: R², Adjusted R², and RMSE
-# > - More accurate predictions → more meaningful residuals → more reliable labels
-# > - By excluding `estimate_msrp` from classification features, the model can also be applied to the 54,805-row test data
-# 
-# ### Residual Calculation
-# 
-# $$\text{residual} = \text{actual price} - \text{predicted price}$$
-# 
-# - residual < 0 → Actual price is lower than predicted → **Underpriced (0)**
-# - residual ≈ 0 → Actual price is similar to predicted → **Fairly Priced (1)**
-# - residual > 0 → Actual price is higher than predicted → **Overpriced (2)**
-# 
-# ### Label Boundary Setting: Percentile Method
-# 
-# The **33rd / 67th percentiles** of residuals are used as boundary values.
-# 
-# Reasons for choosing this approach:
-# 
-# - **No absolute standard**: Since there is no absolute standard for defining the "true fair price" of a vehicle, judging by **relative position** within the entire data is reasonable.
-# - **Guaranteed equal class distribution**: The percentile method always maintains approximately 33% per class, preventing class imbalance. A fixed threshold approach can cause imbalance where a specific class exceeds 90%.
-# - **Training stability**: An equal class distribution allows the model to learn stably without biasing toward a specific class.
-
-# %%
-target_col  = 'price'
-exclude_reg = ['price', 'model']
-reg_feature_cols = [c for c in df_train.columns if c not in exclude_reg]
-
-X_reg = df_train[reg_feature_cols].copy()
-y_reg = df_train[target_col].copy()
-
-numeric_cols = ['condition', 'odometer', 'vehicle_age', 'estimate_msrp']
-scaler_reg   = StandardScaler()
-X_reg[numeric_cols] = scaler_reg.fit_transform(X_reg[numeric_cols])
-
-lr_model = LinearRegression()
-lr_model.fit(X_reg, y_reg)
-y_pred_reg = lr_model.predict(X_reg)
-
-residuals = y_reg - y_pred_reg
-
-# Print residual std and R² (mean always converges to 0 due to regression model properties)
-print(f'Residual Std Dev = {residuals.std():,.0f}')
-print(f'R² = {lr_model.score(X_reg, y_reg):.4f}')
-
-p33 = np.percentile(residuals, 33)
-p67 = np.percentile(residuals, 67)
-print(f'\nBoundaries:  33rd percentile = ${p33:,.0f}  |  67th percentile = ${p67:,.0f}')
-
-price_class = pd.Series(1, index=df_train.index, name='price_class')
-price_class[residuals < p33] = 0
-price_class[residuals > p67] = 2
-
-df_train['residual']    = residuals.values
-df_train['price_class'] = price_class.values
-
-print('\nLabel distribution:')
-counts = df_train['price_class'].value_counts().sort_index()
-label_names = {0: 'Underpriced', 1: 'Fairly Priced', 2: 'Overpriced'}
-for cls, cnt in counts.items():
-    print(f'  {cls} ({label_names[cls]}): {cnt} samples  ({cnt/len(df_train)*100:.1f}%)')
-
-# %% [markdown]
-# ## Step 3. Check Class Distribution
-# 
-# Before training the classification model, visually confirm the number of data points in each class.
-# 
-# If class imbalance is severe, the model may be biased toward predicting only the majority class,
-# so it must be checked in advance.
-
-# %%
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-counts = df_train['price_class'].value_counts().sort_index()
-colors = ['#3498DB', '#2ECC71', '#E74C3C']
-class_labels = ['Underpriced\n(0)', 'Fairly Priced\n(1)', 'Overpriced\n(2)']
-
-bars = axes[0].bar(class_labels, counts.values, color=colors, edgecolor='white', linewidth=0.8)
-for bar, cnt in zip(bars, counts.values):
-    axes[0].text(
-        bar.get_x() + bar.get_width() / 2,
-        bar.get_height() + 20,
-        f'{cnt}\n({cnt/len(df_train)*100:.1f}%)',
-        ha='center', va='bottom', fontsize=11, fontweight='bold'
+if df is None:
+    raise FileNotFoundError(
+        f"'{csv_name}' not found.\n"
+        "Place the file in the same folder as this script or in 'Data/'."
     )
-axes[0].set_title('Class Distribution (Bar Chart)', fontsize=13, fontweight='bold')
-axes[0].set_ylabel('Count', fontsize=11)
-axes[0].set_ylim(0, counts.max() * 1.2)
-axes[0].grid(axis='y', alpha=0.4)
 
-axes[1].pie(
-    counts.values, labels=class_labels, colors=colors,
-    autopct='%1.1f%%', startangle=90, textprops={'fontsize': 11}
+print(f'Shape: {df.shape}  |  Missing: {df.isnull().sum().sum()}')
+print(df.head(3))
+
+numeric_feats = [c for c in df.select_dtypes(include=[np.number]).columns if c != 'price']
+print(f'\nNumeric features for VIF: {len(numeric_feats)}')
+
+
+# -----------------------------------------------------------------------------
+# Step 2. Train / Test Split (8:2)
+# -----------------------------------------------------------------------------
+all_feats = numeric_feats + ['model']
+X_full = df[all_feats].copy()
+y      = df['price'].copy()
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_full, y, test_size=0.2, random_state=42
 )
-axes[1].set_title('Class Distribution (Pie Chart)', fontsize=13, fontweight='bold')
+print(f'Train: {X_train.shape}  Test: {X_test.shape}')
 
-plt.suptitle('Price Adequacy Class Distribution (Training Data, N=7,192)', fontsize=14, fontweight='bold', y=1.02)
+
+# -----------------------------------------------------------------------------
+# Step 3. Target Log Transformation (log1p)
+# Used car prices are right-skewed; log1p brings them closer to normal.
+# Predictions are restored to dollar units with expm1() afterwards.
+# -----------------------------------------------------------------------------
+y_train_log = np.log1p(y_train)
+y_test_log  = np.log1p(y_test)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(y_train,     bins=50, color='#3498DB', edgecolor='white')
+axes[0].set_title('Original price Distribution', fontweight='bold')
+axes[0].set_xlabel('price ($)')
+axes[1].hist(y_train_log, bins=50, color='#E74C3C', edgecolor='white')
+axes[1].set_title('log1p(price) Distribution', fontweight='bold')
+axes[1].set_xlabel('log1p(price)')
 plt.tight_layout()
+plt.savefig('price_distribution.png', dpi=150, bbox_inches='tight')
 plt.show()
-print('\nClass distribution is balanced — no class imbalance → no SMOTE needed')
+print(f'Original range : ${y_train.min():,.0f} ~ ${y_train.max():,.0f}')
+print(f'Transformed    : {y_train_log.min():.3f} ~ {y_train_log.max():.3f}')
 
-# %% [markdown]
-# Label generation based on percentiles resulted in an equal distribution of approximately **33% / 34% / 33%** across the three classes.
-# Since there is no class imbalance, proceed with classification model training without additional processing such as SMOTE.
 
-# %% [markdown]
-# ## Step 4. Feature Alignment and Preprocessing
-# 
-# Align features of the training data (7,192 rows) and test data (54,805 rows) identically.
-# 
-# - **Residual calculation (Step 2)**: Uses Enhanced model → includes `estimate_msrp`
-# - **Classification model features**: Excludes `estimate_msrp` → applicable to 54,805-row test data
-# 
-# | Category | Features | Handling |
-# |------|-----------|----------|
-# | Training data only | `manufacturer_chrysler` | Excluded from classification features |
-# | Test data only | `manufacturer_mercedes-benz`, `title_status_parts only` | Added to training data as 0 |
-# 
-# Final classification features: **50** (3 numeric + 47 OHE)
+# -----------------------------------------------------------------------------
+# Step 4. Helper Functions
+# -----------------------------------------------------------------------------
 
-# %%
-test_feature_cols = [c for c in df_test.columns if c not in ['model_encoded', 'price_log']]
+def encode_and_scale(X_train, X_test, y_train_log,
+                     target_col='model',
+                     scale_cols=None,
+                     smooth=10):
+    """
+    Target Encoding for `model` column + Standard Scaling for numeric columns.
+    Fit only on training data to prevent leakage.
+    """
+    if scale_cols is None:
+        scale_cols = ['odometer', 'vehicle_age']
 
-exclude_clf = ['price', 'model', 'estimate_msrp', 'residual', 'price_class',
-               'manufacturer_chrysler']
-train_feature_cols = [c for c in df_train.columns if c not in exclude_clf]
+    X_tr = X_train.copy()
+    X_te = X_test.copy()
 
-for col in test_feature_cols:
-    if col not in train_feature_cols:
-        df_train[col] = 0
-        train_feature_cols.append(col)
+    te = None
+    encoded_col = f'{target_col}_encoded'
+    if target_col in X_tr.columns:
+        te = TargetEncoder(smooth=smooth)
+        X_tr[encoded_col] = te.fit_transform(X_tr[[target_col]], y_train_log).flatten()
+        X_te[encoded_col] = te.transform(X_te[[target_col]]).flatten()
+        X_tr.drop(columns=[target_col], inplace=True)
+        X_te.drop(columns=[target_col], inplace=True)
 
-train_feature_cols       = sorted(train_feature_cols)
-test_feature_cols_sorted = sorted(test_feature_cols)
+    cols_to_scale = scale_cols + ([encoded_col] if te else [])
+    cols_to_scale = [c for c in cols_to_scale if c in X_tr.columns]
+    scaler = StandardScaler()
+    X_tr[cols_to_scale] = scaler.fit_transform(X_tr[cols_to_scale])
+    X_te[cols_to_scale] = scaler.transform(X_te[cols_to_scale])
 
-assert train_feature_cols == test_feature_cols_sorted, 'Feature mismatch error'
-print(f'Final classification feature count: {len(train_feature_cols)}')
+    return X_tr, X_te, te, scaler
 
-X_clf      = df_train[train_feature_cols].copy()
-y_clf      = df_train['price_class'].copy()
-X_test_clf = df_test[test_feature_cols_sorted].copy()
 
-clf_numeric_cols = ['condition', 'odometer', 'vehicle_age']
-scaler_clf = StandardScaler()
-X_clf[clf_numeric_cols] = scaler_clf.fit_transform(X_clf[clf_numeric_cols])
+def adjusted_r2(r2, n, p):
+    """
+    Adjusted R² — penalises adding features that do not improve the model.
+    Used throughout to fairly compare steps with different feature counts.
 
-print(f'Training data X shape: {X_clf.shape}')
-print(f'Test data X shape: {X_test_clf.shape}')
+    r2 : standard R²
+    n  : number of test samples
+    p  : number of features
+    """
+    return 1 - (1 - r2) * (n - 1) / (n - p - 1)
 
-# %% [markdown]
-# ## Step 5. Train / Validation Split
-# 
-# Split the training data 80:20 for final model evaluation (confusion matrix, etc.) after K-Fold Cross Validation comparison.
-# 
-# - Use `stratify=y` option to maintain the same class ratio as the original in both Train and Validation sets.
 
-# %%
-X_train, X_val, y_train, y_val = train_test_split(
-    X_clf, y_clf, test_size=0.2, random_state=RANDOM_STATE, stratify=y_clf
-)
-print(f'Train set: {X_train.shape[0]} rows  |  Validation set: {X_val.shape[0]} rows')
+print('Functions defined.')
 
-# %% [markdown]
-# ## Step 6. Define Classification Models
-# 
-# Select 4 classification algorithms with different characteristics for comparison of vehicle price adequacy classification.
-# 
-# | Model | Reason for Selection |
-# |------|-----------| 
-# | Logistic Regression | Linear decision boundary-based baseline classifier serving as a reference point for comparison |
-# | Decision Tree | Capable of learning non-linear boundaries with intuitive result interpretation |
-# | K-Nearest Neighbors | Distance-based non-parametric classifier that flexibly adapts to data distribution |
-# | Random Forest | Ensembles multiple Decision Trees, robust to multicollinearity and effective at preventing overfitting |
 
-# %%
-models = {
-    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
-    'Decision Tree'      : DecisionTreeClassifier(max_depth=10, random_state=RANDOM_STATE),
-    'KNN'                : KNeighborsClassifier(n_neighbors=7),
-    'Random Forest'      : RandomForestClassifier(n_estimators=100, max_depth=15,
-                                                   random_state=RANDOM_STATE, n_jobs=-1),
-}
-print('Models used:')
-for name in models:
-    print(f'  - {name}')
-
-# %% [markdown]
-# ## Step 7. K-Fold Cross Validation Comparison
-# 
-# ### Why Use Stratified K-Fold
-# 
-# Standard K-Fold simply divides data into k parts, which can lead to varying class ratios in each fold.
-# For example, one fold may have 60% Underpriced while another has only 10%, making evaluation results unstable.
-# 
-# **Stratified K-Fold** maintains the same class ratio as the original data in each fold.
-# Since the three classes in this analysis are equally distributed at approximately 33% each, the same ratio is guaranteed across all folds,
-# enabling more stable and reliable performance evaluation.
-# 
-# ### Evaluation Metrics
-# 
-# - **Accuracy**: Overall accuracy
-# - **F1-score (macro)**: Simple average of F1-score per class, reflecting balanced performance across classes
-# - Since all 3 classes are equally important in this analysis, **F1-macro is used as the primary selection criterion**.
-
-# %%
-skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-
-cv_results = []
-for name, model in models.items():
-    acc_scores = cross_val_score(model, X_clf, y_clf, cv=skf, scoring='accuracy', n_jobs=-1)
-    f1_scores  = cross_val_score(model, X_clf, y_clf, cv=skf, scoring='f1_macro',  n_jobs=-1)
-    cv_results.append({
-        'Model'   : name,
-        'Acc Mean': acc_scores.mean(),
-        'Acc Std' : acc_scores.std(),
-        'F1 Mean' : f1_scores.mean(),
-        'F1 Std'  : f1_scores.std(),
-    })
-    print(f'[{name}]  Accuracy={acc_scores.mean():.4f}±{acc_scores.std():.4f}  '
-          f'F1-macro={f1_scores.mean():.4f}±{f1_scores.std():.4f}')
-
-cv_df = pd.DataFrame(cv_results).sort_values('F1 Mean', ascending=False).reset_index(drop=True)
-
-# %% [markdown]
-# ## Step 8. Model Performance Comparison Visualization
-
-# %%
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-model_names = cv_df['Model'].tolist()
-colors_bar  = ['#E74C3C', '#3498DB', '#F39C12', '#2ECC71']
-
-for ax, metric, ylabel, title in zip(
-    axes,
-    ['Acc Mean', 'F1 Mean'],
-    ['Accuracy', 'F1-score (macro)'],
-    ['K-Fold CV Accuracy (5-Fold)', 'K-Fold CV F1-score Macro (5-Fold)']
-):
-    std_key = metric.replace('Mean', 'Std')
-    bars = ax.bar(model_names, cv_df[metric], yerr=cv_df[std_key],
-                  color=colors_bar[:len(model_names)], capsize=5, edgecolor='white', linewidth=0.8)
-    for bar, val in zip(bars, cv_df[metric]):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
-                f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-    ax.set_title(title, fontsize=13, fontweight='bold')
-    ax.set_ylabel(ylabel, fontsize=11)
-    ax.set_ylim(0, 1.05)
-    ax.tick_params(axis='x', rotation=15)
-    ax.grid(axis='y', alpha=0.4)
-
-plt.suptitle('Classification Model K-Fold Cross Validation Performance Comparison', fontsize=14, fontweight='bold')
-plt.tight_layout()
-plt.show()
-
-# %% [markdown]
-# **Visualization Interpretation**
-# 
-# - **Random Forest** achieved the highest performance in both Accuracy and F1-macro.
-# - **Logistic Regression** showed significantly low performance due to multicollinearity among features. Multicollinearity makes coefficient estimation in linear models unstable, degrading classification performance.
-# - Smaller error bars indicate more stable performance across folds. Random Forest demonstrates both high performance and stability simultaneously.
-
-# %% [markdown]
-# ## Step 9. Optimal Model Selection and Validation
-# 
-# Select the model with the **highest F1-macro** from K-Fold CV results as the optimal model.
-# 
-# F1-macro is the simple average of F1-score per class,
-# making it the most appropriate evaluation metric for this analysis where
-# Underpriced / Fairly Priced / Overpriced classes are all equally important.
-# 
-# Re-train the selected optimal model on the training set (80%) and evaluate final performance on the validation set (20%).
-
-# %%
-best_model_name = cv_df.iloc[0]['Model']
-best_model      = models[best_model_name]
-print(f'Selected best model: {best_model_name}')
-
-best_model.fit(X_train, y_train)
-y_val_pred = best_model.predict(X_val)
-
-val_acc = accuracy_score(y_val, y_val_pred)
-val_f1  = f1_score(y_val, y_val_pred, average='macro')
-
-print(f'\nValidation set performance (20%, N={len(y_val)}):')
-print(f'  Accuracy  = {val_acc:.4f}')
-print(f'  F1-macro  = {val_f1:.4f}')
-
-# Print per-class performance only (excluding accuracy/macro avg/weighted avg)
-report = classification_report(y_val, y_val_pred,
-                               target_names=['Underpriced', 'Fairly Priced', 'Overpriced'])
-filtered_lines = [
-    line for line in report.split('\n')
-    if not any(x in line for x in ['accuracy', 'macro avg', 'weighted avg'])
+# -----------------------------------------------------------------------------
+# Step 5. Define OHE Groups
+# One-Hot Encoded features from the same original column must be removed
+# together during VIF elimination; dropping only one column causes the
+# remaining dummies' VIFs to spike immediately.
+# -----------------------------------------------------------------------------
+OHE_PREFIXES = [
+    'cylinders', 'manufacturer', 'fuel', 'transmission',
+    'type', 'title_status', 'drive', 'paint_color',
 ]
-print('\nClassification Report (Validation Set):')
-print('\n'.join(filtered_lines))
 
-# %% [markdown]
-# **Classification Report Interpretation**
-# 
-# The meaning of each metric is as follows:
-# - **Precision**: The proportion of correct predictions when the model predicts a given class
-# - **Recall**: The proportion of actual instances of a class that the model correctly classified
-# - **F1-score**: Balanced score of Precision and Recall
-# 
-# Underpriced and Overpriced showed relatively high F1-scores of 0.74.
-# Fairly Priced, on the other hand, showed the lowest F1-score of 0.66 among the three classes.
-# This is because Fairly Priced is the middle class between Underpriced and Overpriced,
-# with unclear boundaries causing confusion with both classes — a natural phenomenon.
+OHE_GROUPS = {}
+for prefix in OHE_PREFIXES:
+    group_feats = [c for c in numeric_feats if c.startswith(prefix + '_')]
+    if group_feats:
+        OHE_GROUPS[prefix] = group_feats
 
-# %% [markdown]
-# ## Step 10. Confusion Matrix
-# 
-# The confusion matrix shows how accurately the model classified each class.
-# 
-# - **Diagonal (↘)**: Correctly predicted cases
-# - **Off-diagonal**: Incorrectly predicted cases (misclassification)
-# 
-# This allows us to identify **class-specific misclassification patterns** that cannot be captured by simple Accuracy alone.
+# Reverse map: feature → group name
+FEAT_TO_GROUP = {feat: grp for grp, feats in OHE_GROUPS.items() for feat in feats}
 
-# %%
-cm = confusion_matrix(y_val, y_val_pred)
-class_labels_str = ['Underpriced', 'Fairly\nPriced', 'Overpriced']
+print('OHE groups:')
+for grp, feats in OHE_GROUPS.items():
+    print(f'  {grp:15s} ({len(feats):2d}): {feats}')
 
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-            xticklabels=class_labels_str, yticklabels=class_labels_str,
-            linewidths=0.5, ax=axes[0])
-axes[0].set_title(f'Confusion Matrix — {best_model_name}\n(Validation Set, Absolute Counts)', fontsize=12, fontweight='bold')
-axes[0].set_xlabel('Predicted Class', fontsize=11)
-axes[0].set_ylabel('Actual Class', fontsize=11)
+# -----------------------------------------------------------------------------
+# Step 6. Iterative VIF Removal + Performance Tracking
+# At each step: compute VIF → train & record metrics → drop highest-VIF feature
+# (or its full OHE group) → repeat until all VIFs < 10.
+# -----------------------------------------------------------------------------
+current_numeric = numeric_feats.copy()
+history = []
 
-cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-sns.heatmap(cm_norm, annot=True, fmt='.2%', cmap='Blues',
-            xticklabels=class_labels_str, yticklabels=class_labels_str,
-            linewidths=0.5, ax=axes[1])
-axes[1].set_title(f'Confusion Matrix — {best_model_name}\n(Validation Set, Proportions)', fontsize=12, fontweight='bold')
-axes[1].set_xlabel('Predicted Class', fontsize=11)
-axes[1].set_ylabel('Actual Class', fontsize=11)
+print(f'\nStarting feature count: {len(current_numeric)}')
+print('=' * 85)
 
+step = 0
+while len(current_numeric) > 1:
+
+    # --- VIF calculation ---
+    vif_data  = X_train[current_numeric].copy()
+    vif_const = add_constant(vif_data)
+    vif_vals  = [
+        variance_inflation_factor(vif_const.values, i + 1)
+        for i in range(len(current_numeric))
+    ]
+    max_vif      = max(vif_vals)
+    max_vif_feat = current_numeric[int(np.argmax(vif_vals))]
+
+    # --- Train Baseline (no estimate_msrp) and record metrics ---
+    feats     = current_numeric + ['model']
+    X_tr_iter = X_train[feats].drop(columns=['estimate_msrp'], errors='ignore')
+    X_te_iter = X_test[feats].drop(columns=['estimate_msrp'],  errors='ignore')
+
+    sc = [c for c in ['odometer', 'vehicle_age'] if c in X_tr_iter.columns]
+    X_tr_enc, X_te_enc, _, _ = encode_and_scale(X_tr_iter, X_te_iter, y_train_log, scale_cols=sc)
+
+    lr = LinearRegression()
+    lr.fit(X_tr_enc, y_train_log)
+    y_pred = np.clip(np.expm1(lr.predict(X_te_enc)), 0, None)
+    y_true = np.expm1(y_test_log)
+
+    n_te   = len(y_true)
+    p_te   = X_te_enc.shape[1]
+    r2     = r2_score(y_true, y_pred)
+    adj_r2 = adjusted_r2(r2, n_te, p_te)
+    rmse   = np.sqrt(mean_squared_error(y_true, y_pred))
+
+    # --- Determine which features to remove ---
+    if max_vif_feat in FEAT_TO_GROUP:
+        group_name      = FEAT_TO_GROUP[max_vif_feat]
+        feats_to_remove = [f for f in OHE_GROUPS[group_name] if f in current_numeric]
+        remove_label    = f'[OHE] {group_name} ({len(feats_to_remove)} features)'
+    else:
+        feats_to_remove = [max_vif_feat]
+        remove_label    = max_vif_feat
+
+    history.append({
+        'step'         : step,
+        'n_features'   : len(current_numeric),
+        'max_vif'      : max_vif,
+        'max_vif_feat' : max_vif_feat,
+        'removed'      : feats_to_remove if max_vif >= 10 else [],
+        'remove_label' : remove_label if max_vif >= 10 else '(none)',
+        'R²'           : r2,
+        'Adj. R²'      : adj_r2,
+        'RMSE'         : rmse,
+        'features'     : current_numeric.copy(),
+    })
+
+    print(f'Step {step:2d} | Features {len(current_numeric):2d} | Max VIF={max_vif:8.2f} '
+          f'({max_vif_feat}) | R²={r2:.4f} | Adj.R²={adj_r2:.4f} | RMSE=${rmse:,.0f}')
+
+    if max_vif < 10:
+        print('\nAll VIFs < 10 → stopping.')
+        break
+
+    if max_vif_feat in FEAT_TO_GROUP:
+        print(f'       → Remove OHE group [{FEAT_TO_GROUP[max_vif_feat]}]: {feats_to_remove}')
+    else:
+        print(f'       → Remove: {max_vif_feat}')
+
+    for f in feats_to_remove:
+        if f in current_numeric:
+            current_numeric.remove(f)
+
+    step += 1
+
+print('=' * 85)
+print(f'{len(history)} steps completed.')
+
+
+# -----------------------------------------------------------------------------
+# Step 7. Select Optimal Feature Combination (highest Adjusted R²)
+# The stopping point (VIF < 10) and the best-performing step are separate;
+# pick the step with the highest Adjusted R² as the final feature set.
+# -----------------------------------------------------------------------------
+hist_df  = pd.DataFrame(history)
+best_idx = hist_df['Adj. R²'].idxmax()
+best_step = hist_df.loc[best_idx]
+
+SELECTED_NUMERIC  = best_step['features']
+SELECTED_FEATURES = ['model'] + SELECTED_NUMERIC
+
+print(f'Optimal step  : Step {int(best_step["step"])}')
+print(f'Feature count : {len(SELECTED_NUMERIC)} numeric + model')
+print(f'Max VIF       : {best_step["max_vif"]:.2f}')
+print(f'R²            : {best_step["R²"]:.4f}')
+print(f'Adj. R²       : {best_step["Adj. R²"]:.4f}')
+print(f'RMSE          : ${best_step["RMSE"]:,.0f}')
+print(f'\nSelected features: {SELECTED_FEATURES}')
+
+# --- 4-panel VIF history chart ---
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+axes = axes.flatten()
+steps      = hist_df['step'].tolist()
+n_features = hist_df['n_features'].tolist()
+max_vifs   = hist_df['max_vif'].tolist()
+r2s        = hist_df['R²'].tolist()
+adj_r2s    = hist_df['Adj. R²'].tolist()
+
+axes[0].plot(steps, adj_r2s, marker='o', color='#9B59B6', linewidth=2, label='Adj. R²')
+axes[0].axvline(best_idx, color='red', linestyle='--', linewidth=1.5, label=f'Optimal Step {int(best_step["step"])}')
+axes[0].scatter([best_idx], [best_step['Adj. R²']], color='red', s=100, zorder=5)
+axes[0].set_xlabel('Step'); axes[0].set_ylabel('Adjusted R²')
+axes[0].set_title('Adjusted R² Trend (Optimal Step Selection)', fontweight='bold')
+axes[0].legend()
+
+axes[1].plot(steps, r2s, marker='o', color='#3498DB', linewidth=2, label='R²')
+axes[1].axvline(best_idx, color='red', linestyle='--', linewidth=1.5, label=f'Optimal Step {int(best_step["step"])}')
+axes[1].scatter([best_idx], [best_step['R²']], color='red', s=100, zorder=5)
+axes[1].set_xlabel('Step'); axes[1].set_ylabel('R²')
+axes[1].set_title('R² Trend (Reference)', fontweight='bold')
+axes[1].legend()
+
+axes[2].plot(steps, max_vifs, marker='o', color='#E74C3C', linewidth=2)
+axes[2].axhline(10, color='red', linestyle='--', linewidth=1.5, label='VIF = 10 threshold')
+axes[2].axvline(best_idx, color='blue', linestyle='--', linewidth=1.5, label=f'Optimal Step {int(best_step["step"])}')
+axes[2].set_xlabel('Step'); axes[2].set_ylabel('Max VIF')
+axes[2].set_title('Max VIF Trend', fontweight='bold')
+axes[2].legend()
+
+axes[3].plot(steps, n_features, marker='o', color='#27AE60', linewidth=2)
+axes[3].axvline(best_idx, color='red', linestyle='--', linewidth=1.5, label=f'Optimal Step {int(best_step["step"])}')
+axes[3].set_xlabel('Step'); axes[3].set_ylabel('Feature Count')
+axes[3].set_title('Feature Count Trend', fontweight='bold')
+axes[3].legend()
+
+plt.suptitle('Iterative VIF Removal — Optimal Step: Adjusted R²', fontsize=12, fontweight='bold')
 plt.tight_layout()
+plt.savefig('iterative_vif_history.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# %% [markdown]
-# **Confusion Matrix Interpretation**
-# 
-# - **Underpriced**: Approximately 77% correctly classified; the remainder was mostly misclassified as Fairly Priced.
-# - **Fairly Priced**: Shows the lowest accuracy among the three classes. As the middle class between Underpriced and Overpriced, confusion with both classes due to unclear boundaries is a natural phenomenon.
-# - **Overpriced**: Approximately 72% correctly classified; misclassifications were mostly in the direction of Fairly Priced.
-# - Overall, the model tends to **predict toward the middle class (Fairly Priced)** when confidence is low.
 
-# %% [markdown]
-# ## Step 11. Apply Classification to 54,805-Row Test Data
-# 
-# Re-train the optimal model on the **entire 7,192 rows**,
-# then apply classification to the large dataset of 54,805 vehicle records.
-# 
-# This allows us to identify the overall pricing tendency of vehicles in the dataset.
+# -----------------------------------------------------------------------------
+# Step 8. Baseline vs Enhanced — Final Training and Evaluation
+# Baseline : SELECTED_FEATURES without estimate_msrp
+# Enhanced : SELECTED_FEATURES including estimate_msrp
+# Adjusted R² is the key comparison metric because the two models differ
+# by exactly one feature; a plain R² comparison would always favour Enhanced.
+# -----------------------------------------------------------------------------
+X_final = df[SELECTED_FEATURES].copy()
+y_final = df['price'].copy()
 
-# %%
-best_model.fit(X_clf, y_clf)
-y_test_pred = best_model.predict(X_test_clf)
-
-df_test['price_class'] = y_test_pred
-df_test['price_label'] = df_test['price_class'].map({
-    0: 'Underpriced', 1: 'Fairly Priced', 2: 'Overpriced'
-})
-
-test_counts = df_test['price_class'].value_counts().sort_index()
-print('Classification results for 54,805-row test data:')
-for cls, cnt in test_counts.items():
-    lbl = {0: 'Underpriced', 1: 'Fairly Priced', 2: 'Overpriced'}[cls]
-    print(f'  {cls} ({lbl}): {cnt:,} samples  ({cnt/len(df_test)*100:.1f}%)')
-
-# %% [markdown]
-# ## Step 12. Visualize Test Data Classification Results
-
-# %%
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-test_counts       = df_test['price_class'].value_counts().sort_index()
-class_labels_test = ['Underpriced\n(0)', 'Fairly Priced\n(1)', 'Overpriced\n(2)']
-colors            = ['#3498DB', '#2ECC71', '#E74C3C']
-
-bars = axes[0].bar(class_labels_test, test_counts.values, color=colors, edgecolor='white', linewidth=0.8)
-for bar, cnt in zip(bars, test_counts.values):
-    axes[0].text(
-        bar.get_x() + bar.get_width() / 2, bar.get_height() + 100,
-        f'{cnt:,}\n({cnt/len(df_test)*100:.1f}%)',
-        ha='center', va='bottom', fontsize=10, fontweight='bold'
-    )
-axes[0].set_title('Predicted Class Distribution (54,805 rows)', fontsize=13, fontweight='bold')
-axes[0].set_ylabel('Vehicle Count', fontsize=11)
-axes[0].set_ylim(0, test_counts.max() * 1.2)
-axes[0].grid(axis='y', alpha=0.4)
-
-axes[1].pie(
-    test_counts.values, labels=class_labels_test, colors=colors,
-    autopct='%1.1f%%', startangle=90, textprops={'fontsize': 11}
+X_tr_final, X_te_final, y_tr_final, y_te_final = train_test_split(
+    X_final, y_final, test_size=0.2, random_state=42
 )
-axes[1].set_title('Predicted Class Ratio (54,805 rows)', fontsize=13, fontweight='bold')
+y_tr_log = np.log1p(y_tr_final)
+y_te_log = np.log1p(y_te_final)
 
-plt.suptitle(f'[{best_model_name}] Price Adequacy Classification Results on Test Data',
-             fontsize=14, fontweight='bold')
+X_tr_base, X_te_base, _, _ = encode_and_scale(
+    X_tr_final.drop(columns=['estimate_msrp'], errors='ignore'),
+    X_te_final.drop(columns=['estimate_msrp'], errors='ignore'),
+    y_tr_log
+)
+X_tr_enh, X_te_enh, _, _ = encode_and_scale(
+    X_tr_final.copy(), X_te_final.copy(), y_tr_log
+)
+
+
+def train_and_evaluate(config_name, X_tr, X_te, y_tr_log, y_te_log):
+    """Train Linear Regression and return evaluation metrics + predictions."""
+    model = LinearRegression()
+    model.fit(X_tr, y_tr_log)
+    y_pred = np.clip(np.expm1(model.predict(X_te)), 0, None)
+    y_true = np.expm1(y_te_log)
+
+    n  = len(y_true)
+    p  = X_te.shape[1]
+    r2 = r2_score(y_true, y_pred)
+
+    return {
+        'Config'  : config_name,
+        'MAE'     : mean_absolute_error(y_true, y_pred),
+        'RMSE'    : np.sqrt(mean_squared_error(y_true, y_pred)),
+        'R²'      : r2,
+        'Adj. R²' : adjusted_r2(r2, n, p),
+        'n'       : n,
+        'p'       : p,
+        'y_true'  : y_true,
+        'y_pred'  : y_pred,
+        'model'   : model,
+        'X_test'  : X_te,
+    }
+
+
+res_base = train_and_evaluate('Baseline', X_tr_base, X_te_base, y_tr_log, y_te_log)
+res_enh  = train_and_evaluate('Enhanced', X_tr_enh,  X_te_enh,  y_tr_log, y_te_log)
+
+print(f'\n{"":12} {"MAE":>12} {"RMSE":>12} {"R²":>8} {"Adj. R²":>10} {"Features":>8}')
+print('-' * 66)
+for res in [res_base, res_enh]:
+    print(f'{res["Config"]:12} ${res["MAE"]:>10,.0f} ${res["RMSE"]:>10,.0f} '
+          f'{res["R²"]:>8.4f} {res["Adj. R²"]:>10.4f} {res["p"]:>8}')
+
+
+# -----------------------------------------------------------------------------
+# Step 9. Visualization
+# -----------------------------------------------------------------------------
+
+# --- Bar chart: 4 metrics side-by-side ---
+configs    = ['Baseline', 'Enhanced']
+bar_colors = ['#3498DB', '#E74C3C']
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+axes = axes.flatten()
+
+metrics = [
+    ([res_base['R²'],      res_enh['R²']],      'R² Score',    '{:.4f}',  True),
+    ([res_base['Adj. R²'], res_enh['Adj. R²']], 'Adjusted R²', '{:.4f}',  True),
+    ([res_base['RMSE'],    res_enh['RMSE']],    'RMSE ($)',    '${:,.0f}', False),
+    ([res_base['MAE'],     res_enh['MAE']],     'MAE ($)',     '${:,.0f}', False),
+]
+
+for ax, (vals, title, fmt, is_r2) in zip(axes, metrics):
+    bars = ax.bar(configs, vals, color=bar_colors, edgecolor='white', width=0.5)
+    ax.set_title(title, fontweight='bold', fontsize=12)
+    for bar, val in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() * 1.01,
+                fmt.format(val),
+                ha='center', fontweight='bold', fontsize=11)
+    if is_r2:
+        ax.set_ylim(0, 1)
+
+plt.suptitle('Linear Regression — Baseline vs Enhanced', fontsize=13, fontweight='bold')
 plt.tight_layout()
+plt.savefig('baseline_vs_enhanced.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# %% [markdown]
-# ## Step 13. Price Range Class Distribution Analysis
-# 
-# Divide the `price_log` (log price) of test data into 5 intervals
-# and analyze the price adequacy distribution by price range.
-# 
-# This allows us to identify whether under- or over-valuation tendencies are concentrated in specific price ranges.
+print(f'R²       : {res_base["R²"]:.4f} → {res_enh["R²"]:.4f}  ({res_enh["R²"]-res_base["R²"]:+.4f})')
+print(f'Adj. R²  : {res_base["Adj. R²"]:.4f} → {res_enh["Adj. R²"]:.4f}  ({res_enh["Adj. R²"]-res_base["Adj. R²"]:+.4f})')
+print(f'RMSE     : ${res_base["RMSE"]:,.0f} → ${res_enh["RMSE"]:,.0f}  ({res_base["RMSE"]-res_enh["RMSE"]:+,.0f}$)')
+print(f'MAE      : ${res_base["MAE"]:,.0f} → ${res_enh["MAE"]:,.0f}  ({res_base["MAE"]-res_enh["MAE"]:+,.0f}$)')
 
-# %%
-df_test['price_bin'] = pd.qcut(
-    df_test['price_log'], q=5,
-    labels=['Very Low', 'Low', 'Mid', 'High', 'Very High']
+# --- Actual vs Predicted scatter (Enhanced) ---
+fig, ax = plt.subplots(figsize=(8, 7))
+ax.scatter(res_enh['y_true'], res_enh['y_pred'], alpha=0.3, s=10, color='#3498DB')
+lim = max(res_enh['y_true'].max(), res_enh['y_pred'].max())
+ax.plot([0, lim], [0, lim], 'r--', linewidth=1.5, label='Perfect Prediction Line')
+ax.set_xlabel('Actual Price ($)')
+ax.set_ylabel('Predicted Price ($)')
+ax.set_title(
+    f'Actual vs Predicted — Enhanced\n'
+    f'R²={res_enh["R²"]:.4f}  Adj.R²={res_enh["Adj. R²"]:.4f}  RMSE=${res_enh["RMSE"]:,.0f}',
+    fontweight='bold'
 )
-
-price_class_dist = (
-    df_test.groupby(['price_bin', 'price_class'], observed=True)
-    .size().unstack(fill_value=0)
-    .apply(lambda x: x / x.sum(), axis=1)
-)
-price_class_dist.columns = ['Underpriced', 'Fairly Priced', 'Overpriced']
-
-fig, ax = plt.subplots(figsize=(10, 6))
-price_class_dist.plot(kind='bar', stacked=True,
-                      color=['#3498DB', '#2ECC71', '#E74C3C'],
-                      edgecolor='white', linewidth=0.5, ax=ax)
-ax.set_title('Class Distribution by Price Range (54,805 rows)', fontsize=13, fontweight='bold')
-ax.set_xlabel('Price Range (based on log price)', fontsize=11)
-ax.set_ylabel('Class Ratio', fontsize=11)
-ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
-ax.legend(title='Class', loc='upper right')
-ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0%}'))
-ax.grid(axis='y', alpha=0.4)
+ax.legend()
 plt.tight_layout()
+plt.savefig('actual_vs_predicted.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# %% [markdown]
-# **Price Range Distribution Interpretation**
-# 
-# - **Very Low Price**: The Overpriced ratio is highest. This means many cheap vehicles are overvalued relative to their fair price.
-# - **Low / Mid Price**: The Underpriced ratio is high, indicating that mid-to-low priced vehicles tend to be sold relatively cheaply.
-# - **High Price**: Underpriced and Overpriced appear at similar ratios, indicating mixed price adequacy.
-# - **Very High Price**: The Overpriced ratio is overwhelmingly high. The more expensive the vehicle, the stronger the tendency to be sold above its fair price.
-# 
-# > **Key Insight**: Overpriced tendencies are strong at both ends of the price spectrum (very low and very high), while Underpriced tendencies are prominent in the middle price range.
 
-# %% [markdown]
-# ## Step 14. Dataset Pricing Tendency Analysis
-# 
-# From the 54,805-row classification results, identify the **class with the highest proportion**
-# to derive the overall pricing tendency of the dataset.
+# -----------------------------------------------------------------------------
+# Step 10. Conclusion Summary
+# -----------------------------------------------------------------------------
+r2_diff     = res_enh['R²']      - res_base['R²']
+adj_r2_diff = res_enh['Adj. R²'] - res_base['Adj. R²']
+rmse_diff   = res_base['RMSE']   - res_enh['RMSE']
+mae_diff    = res_base['MAE']    - res_enh['MAE']
+removed_groups = [h['remove_label'] for h in history if h['removed']]
 
-# %%
-test_counts = df_test['price_class'].value_counts().sort_index()
-label_map   = {0: 'Underpriced', 1: 'Fairly Priced', 2: 'Overpriced'}
+print('=' * 62)
+print('           Linear Regression Analysis Conclusion')
+print('=' * 62)
 
-dominant_class = test_counts.idxmax()
-dominant_label = label_map[dominant_class]
-dominant_pct   = test_counts.max() / len(df_test) * 100
+print(f'\n[1] Iterative VIF Removal')
+print(f'    Initial features : {len(numeric_feats)}')
+print(f'    Steps explored   : {len(history)}')
+print(f'    Removed groups   : {removed_groups}')
+print(f'    Optimal step     : Step {int(best_step["step"])} → {len(SELECTED_NUMERIC)} features + model')
+print(f'    Optimal max VIF  : {best_step["max_vif"]:.2f}  (multicollinearity present)')
+print(f'    → Coefficient interpretation is unreliable, but prediction metrics remain valid.')
 
-print('=' * 55)
-print('  Class proportions in 54,805-row test data')
-print('=' * 55)
-for cls, cnt in test_counts.items():
-    marker = ' ◀ Most' if cls == dominant_class else ''
-    print(f'  {label_map[cls]:15s}: {cnt:,} samples  ({cnt/len(df_test)*100:.1f}%){marker}')
-print('=' * 55)
-print()
+print(f'\n[2] Baseline vs Enhanced')
+print(f'    {"":10} {"R²":>8} {"Adj. R²":>10} {"RMSE":>10} {"MAE":>10} {"Features":>8}')
+print(f'    {"-" * 58}')
+print(f'    {"Baseline":10} {res_base["R²"]:>8.4f} {res_base["Adj. R²"]:>10.4f} '
+      f'${res_base["RMSE"]:>9,.0f} ${res_base["MAE"]:>9,.0f} {res_base["p"]:>8}')
+print(f'    {"Enhanced":10} {res_enh["R²"]:>8.4f} {res_enh["Adj. R²"]:>10.4f} '
+      f'${res_enh["RMSE"]:>9,.0f} ${res_enh["MAE"]:>9,.0f} {res_enh["p"]:>8}')
+print(f'    {"Change":10} {r2_diff:>+8.4f} {adj_r2_diff:>+10.4f} '
+      f'${rmse_diff:>+9,.0f} ${mae_diff:>+9,.0f}')
 
-if dominant_class == 0:
-    print(f'→ Dominant class: Underpriced ({dominant_pct:.1f}%)')
-    print()
-    print('  Vehicles in this dataset are generally priced')
-    print('  below the fair market value.')
-    print('  In other words, this dataset represents a market with many undervalued vehicles.')
-elif dominant_class == 1:
-    print(f'→ Dominant class: Fairly Priced ({dominant_pct:.1f}%)')
-    print()
-    print('  Vehicles in this dataset are generally priced')
-    print('  at fair market value.')
-    print('  In other words, this dataset represents a market with well-priced vehicles.')
-elif dominant_class == 2:
-    print(f'→ Dominant class: Overpriced ({dominant_pct:.1f}%)')
-    print()
-    print('  Vehicles in this dataset are generally priced')
-    print('  above the fair market value.')
-    print('  In other words, this dataset represents a market with many overvalued vehicles.')
+print(f'\n[3] Impact of estimate_msrp')
+print(f'    Adj. R² change : {adj_r2_diff:+.4f}')
+print(f'    RMSE change    : {rmse_diff:+,.0f}$')
+print(f'    MAE change     : {mae_diff:+,.0f}$')
+if adj_r2_diff > 0.005:
+    print('    → Adj. R² significantly improved → estimate_msrp is genuinely useful.')
+elif adj_r2_diff > 0:
+    print('    → Adj. R² slightly improved → estimate_msrp contributes modest gain.')
+else:
+    print('    → Adj. R² did not improve → estimate_msrp adds minimal value.')
 
-# %% [markdown]
-# ## Step 15. Conclusion
-# 
-# ### Analysis Summary
-# 
-# This notebook built a machine learning pipeline to classify vehicle price adequacy based on regression model residuals
-# and derived the overall pricing tendency of a large dataset.
-# 
-# ### Label Generation
-# 
-# Predicted prices for 7,192 vehicles were calculated using the Enhanced Linear Regression model (including estimate_msrp)
-# and price adequacy labels were generated based on residuals.
-# The **percentile method** was adopted for label generation.
-# Since there is no absolute standard for vehicle fair pricing, judging by relative position within the entire data is rational,
-# and maintaining approximately 33% equal distribution across three classes ensured training stability for the classification model.
-# 
-# ### Model Comparison (Stratified K-Fold Cross Validation)
-# 
-# **Stratified 5-Fold Cross Validation** was performed on 4 models.
-# Stratified K-Fold maintains the same class ratio as the original in each fold,
-# enabling stable and reliable performance evaluation.
-# Logistic Regression showed low performance due to multicollinearity among features,
-# while **Random Forest**, which is robust to multicollinearity, showed the best F1-macro performance and was selected as the optimal model.
-# 
-# ### Dataset Pricing Tendency
-# 
-# Applying the selected Random Forest model to 54,805 rows of large-scale vehicle data,
-# the overall pricing tendency of the dataset was identified based on the class with the highest proportion.
-# Price range analysis also confirmed that Overpriced tendencies were prominent for very low and very high priced vehicles,
-# while Underpriced tendencies were prominent for mid-priced vehicles.
-# 
-# ### Limitations and Future Work
-# 
-# - There is some inconsistency due to different scaling standards between training data (7,192 rows) and test data (54,805 rows). Applying the same scaler in the future can improve model consistency.
-# - Residual-based labels depend on the quality of the regression model, so using a more refined regression model could improve label quality.
-# - SMOTE was not applied due to no class imbalance, but re-evaluation is needed if label criteria change in the future.
-
-
+print('=' * 62)
