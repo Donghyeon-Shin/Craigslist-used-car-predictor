@@ -405,8 +405,8 @@ plt.show()
 
 print(f'R²       : {res_base["R²"]:.4f} → {res_enh["R²"]:.4f}  ({res_enh["R²"]-res_base["R²"]:+.4f})')
 print(f'Adj. R²  : {res_base["Adj. R²"]:.4f} → {res_enh["Adj. R²"]:.4f}  ({res_enh["Adj. R²"]-res_base["Adj. R²"]:+.4f})')
-print(f'RMSE     : ${res_base["RMSE"]:,.0f} → ${res_enh["RMSE"]:,.0f}  ({res_base["RMSE"]-res_enh["RMSE"]:+,.0f}$)')
-print(f'MAE      : ${res_base["MAE"]:,.0f} → ${res_enh["MAE"]:,.0f}  ({res_base["MAE"]-res_enh["MAE"]:+,.0f}$)')
+print(f'RMSE     : ${res_base["RMSE"]:,.0f} → ${res_enh["RMSE"]:,.0f}  ({res_enh["RMSE"]-res_base["RMSE"]:+,.0f}$)')
+print(f'MAE      : ${res_base["MAE"]:,.0f} → ${res_enh["MAE"]:,.0f}  ({res_enh["MAE"]-res_base["MAE"]:+,.0f}$)')
 
 # --- Actual vs Predicted scatter (Enhanced) ---
 fig, ax = plt.subplots(figsize=(8, 7))
@@ -431,8 +431,8 @@ plt.show()
 # -----------------------------------------------------------------------------
 r2_diff     = res_enh['R²']      - res_base['R²']
 adj_r2_diff = res_enh['Adj. R²'] - res_base['Adj. R²']
-rmse_diff   = res_base['RMSE']   - res_enh['RMSE']
-mae_diff    = res_base['MAE']    - res_enh['MAE']
+rmse_diff   = res_enh['RMSE']   - res_base['RMSE']
+mae_diff    = res_enh['MAE']    - res_base['MAE']
 removed_groups = [h['remove_label'] for h in history if h['removed']]
 
 print('=' * 62)
